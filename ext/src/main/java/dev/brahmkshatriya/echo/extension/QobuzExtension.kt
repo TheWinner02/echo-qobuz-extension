@@ -150,9 +150,9 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
     override suspend fun loadHomeFeed(): Feed<Shelf> {
         val hasCustom = userAuthToken != null
         val message = if (hasCustom) {
-            "Qobuz Extension active with personal account!"
+            "Qobuz active with personal account!"
         } else {
-            "Qobuz Extension active with shared rotating token pool!"
+            "Qobuz active with shared rotating token pool!"
         }
         val welcomeShelf = Shelf.Lists.Items(
             id = "welcome",

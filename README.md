@@ -1,4 +1,4 @@
-# Qobuz Extension
+# Qobuz
 
 A Qobuz music streaming service extension for the Echo music player.
 
