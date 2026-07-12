@@ -35,7 +35,7 @@ fun QobuzTrack.toTrack(size: ImageSize) = Track(
     }),
     duration = duration * 1000L,
     isrc = isrc,
-    isPlayable = if (streamable) Track.Playable.Yes else Track.Playable.No,
+    isPlayable = (if (streamable) Track.Playable.Yes else Track.Playable.No) as Track.Playable,
     isRadioSupported = false
 )
 
@@ -49,7 +49,7 @@ fun QobuzAlbumItem.toAlbum(size: ImageSize) = Album(
             name = it
         )
     }),
-    trackCount = tracks_count,
+    trackCount = tracks_count.toLong(),
     isRadioSupported = false
 )
 
@@ -63,7 +63,7 @@ fun QobuzAlbumDetailResponse.toAlbum(size: ImageSize) = Album(
             name = it
         )
     }),
-    trackCount = tracks.items.size,
+    trackCount = tracks.items.size.toLong(),
     isRadioSupported = false
 )
 
@@ -96,7 +96,7 @@ fun QobuzPlaylistItem.toPlaylist(size: ImageSize) = Playlist(
     isPrivate = false,
     cover = null, // Qobuz playlists might not have cover images easily, or use placeholder
     description = description,
-    trackCount = tracks_count,
+    trackCount = tracks_count.toLong(),
     isRadioSupported = false
 )
 
@@ -107,7 +107,7 @@ fun QobuzPlaylistDetailResponse.toPlaylist(size: ImageSize) = Playlist(
     isPrivate = false,
     cover = null,
     description = description,
-    trackCount = tracks.items.size,
+    trackCount = tracks.items.size.toLong(),
     isRadioSupported = false
 )
 

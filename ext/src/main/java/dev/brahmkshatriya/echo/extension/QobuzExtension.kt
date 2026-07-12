@@ -1,6 +1,7 @@
 package dev.brahmkshatriya.echo.extension
 
 import dev.brahmkshatriya.echo.common.clients.*
+import dev.brahmkshatriya.echo.common.helpers.ContinuationCallback.Companion.await
 import dev.brahmkshatriya.echo.common.helpers.Page
 import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.*
@@ -14,11 +15,71 @@ import dev.brahmkshatriya.echo.common.settings.Settings
 import dev.brahmkshatriya.echo.extension.model.ImageSize
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+
+object TokenPool {
+    private val defaultTokens = listOf(
+        "jM-6F2QcDpfG7fj1RRPq7bAa7tBVCykt__5HD1K25v2yFq0c9_-SmXEhG-74moNpN5YQTmFFyyMq2F70h1G17A",
+        "1aFowv-ylpS5sYZv2ifXwHVjES9RX752HUozlaDS6YqZ4Fugp3pfNb3_40h2IV0IzBzqpkTPpmUi5SHGNP6qIQ",
+        "e5LOIO2m1Da_MCglsOH2I_gjKlmd3dOUguFe9btPlkeSe5vcwU-zUWVyJF272_n_XvIP7M-yAKIpbre_WTqRfw",
+        "J1nl2UXyZ9Pd2SF5s_YjvyNORbwe1UwNjHchv-UgOcE_WgrVSQvCoFQdTxgjYyBYDqgWfHfOlVT5wGZlvINrHA",
+        "79ilZ_slkk1p0ZEoyR0MbynH4m9W1AnDrSlP1wQjyVfzfsa14g5N__AJ2kngJT-j9pNqa6u_qDLiP4_SBapbyA"
+    )
+    
+    private var activeTokens = defaultTokens.toMutableList()
+    private var currentIndex = 0
+    private var isFetched = false
+
+    fun getActiveToken(): String {
+        if (activeTokens.isEmpty()) return defaultTokens[0]
+        return activeTokens[currentIndex % activeTokens.size]
+    }
+
+    fun rotateToken() {
+        if (activeTokens.isNotEmpty()) {
+            currentIndex = (currentIndex + 1) % activeTokens.size
+        }
+    }
+
+    suspend fun fetchPool(client: OkHttpClient) {
+        if (isFetched) return
+        try {
+            val req = Request.Builder()
+                .url("https://citegptapi.f5.si/webhook/qbdlx/shared")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .header("Origin", "https://qbdlx.launchpd.cloud")
+                .header("Referer", "https://qbdlx.launchpd.cloud/")
+                .build()
+            val response = client.newCall(req).await()
+            if (response.isSuccessful) {
+                val body = response.body?.string().orEmpty()
+                val json = Json { ignoreUnknownKeys = true }
+                val array = json.parseToJsonElement(body).jsonArray
+                val tokens = mutableListOf<String>()
+                for (element in array) {
+                    val obj = element.jsonObject
+                    val token = obj["token"]?.jsonPrimitive?.contentOrNull
+                    val appId = obj["app_id"]?.jsonPrimitive?.contentOrNull ?: obj["app_id"]?.toString()
+                    if (!token.isNullOrBlank() && appId == "798273057") {
+                        tokens.add(token)
+                    }
+                }
+                if (tokens.isNotEmpty()) {
+                    activeTokens = tokens.distinct().toMutableList()
+                    currentIndex = 0
+                    isFetched = true
+                }
+            }
+        } catch (e: Exception) {
+            // Fallback to default hardcoded pool
+        }
+    }
+}
 
 class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
     TrackClient, AlbumClient, PlaylistClient, ArtistClient {
@@ -29,13 +90,13 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         SettingTextInput(
             "Qobuz user_auth_token",
             "userAuthToken",
-            "Enter your Qobuz user_auth_token to enable direct lossless streaming",
+            "Enter your Qobuz user_auth_token (optional, defaults to shared rotating pool)",
             ""
         ),
         SettingTextInput(
             "Qobuz Resolver URL",
             "resolverUrl",
-            "Base URL for a Qobuz resolver proxy (like http://192.168.1.100:8000), leave empty for direct API",
+            "Base URL for a Qobuz resolver proxy, leave empty for direct API",
             ""
         ),
         SettingSwitch(
@@ -55,79 +116,86 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
     val only320 get() = setting.getBoolean("only320") ?: false
 
     val imageSize by lazy { ImageSize.MEDIUM }
-    val api by lazy { QobuzApi().apply { userAuthToken = this@QobuzExtension.userAuthToken } }
+    val api by lazy { QobuzApi() }
     val httpClient = OkHttpClient()
 
-    override suspend fun loadHomeFeed(cursor: String?): Feed<Shelf> {
-        // Return a simple category feed to welcome the user and explain configuration
-        val message = if (userAuthToken == null && resolverUrl == null) {
-            "Please configure your Qobuz user_auth_token or a Resolver URL in Settings."
-        } else {
-            "Qobuz Extension is active! Use Search to find music."
+    private suspend fun <T> withRetry(block: suspend () -> T): T {
+        val customToken = userAuthToken
+        if (customToken != null) {
+            api.userAuthToken = customToken
+            return block()
         }
-        return Feed(listOf(
-            Shelf.Lists.Items(
-                id = "welcome",
-                title = "Qobuz Lossless Integration",
-                subtitle = message,
-                list = emptyList()
-            )
-        ))
+        
+        TokenPool.fetchPool(httpClient)
+        
+        var attempts = 0
+        val maxAttempts = TokenPool.getActiveToken().let { 5 }
+        while (attempts < maxAttempts) {
+            val token = TokenPool.getActiveToken()
+            api.userAuthToken = token
+            try {
+                return block()
+            } catch (e: Exception) {
+                if (e.message?.contains("401") == true) {
+                    TokenPool.rotateToken()
+                    attempts++
+                } else {
+                    throw e
+                }
+            }
+        }
+        throw IllegalStateException("Qobuz Pool: All shared tokens failed authentication")
     }
 
-    override suspend fun search(
-        query: String,
-        context: SearchFeedClient.Context?,
-    ): Feed<Shelf> {
-        api.userAuthToken = userAuthToken
-        if (context != null) {
-            val tab = context.tab
-            return Feed(listOf()) {
-                val res = api.search(query).value
-                when (tab?.id) {
-                    "ALL" -> listOfNotNull(
+    override suspend fun loadHomeFeed(): Feed<Shelf> {
+        val hasCustom = userAuthToken != null
+        val message = if (hasCustom) {
+            "Qobuz Extension active with personal account!"
+        } else {
+            "Qobuz Extension active with shared rotating token pool!"
+        }
+        val welcomeShelf = Shelf.Lists.Items(
+            id = "welcome",
+            title = "Qobuz Lossless Integration",
+            subtitle = message,
+            list = emptyList()
+        )
+        return Feed(listOf()) {
+            listOf(welcomeShelf).toFeedData()
+        }
+    }
+
+    override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+        val tabs = listOf(
+            "ALL", "TRACKS", "ARTISTS", "ALBUMS", "PLAYLISTS"
+        ).map { s ->
+            Tab(s, s.lowercase().replaceFirstChar { it.uppercase() })
+        }
+        return Feed(tabs) { tab ->
+            when (tab?.id) {
+                "ALL" -> {
+                    val res = withRetry { api.search(query).value }
+                    listOfNotNull(
                         res.tracks.items.toTrackShelf("TRACKS", imageSize),
                         res.albums.items.toAlbumShelf("ALBUMS", imageSize),
                         res.artists.items.toArtistShelf("ARTISTS", imageSize),
                         res.playlists.items.toPlaylistShelf("PLAYLISTS", imageSize)
                     ).toFeedData()
-                    "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf("TRACKS", imageSize).toFeedData()
-                    "ARTISTS" -> api.searchArtists(query).value.artists.items.toArtistShelf("ARTISTS", imageSize).toFeedData()
-                    "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf("ALBUMS", imageSize).toFeedData()
-                    "PLAYLISTS" -> api.searchPlaylists(query).value.playlists.items.toPlaylistShelf("PLAYLISTS", imageSize).toFeedData()
-                    else -> throw Exception("Unknown tab id: ${tab?.id}")
                 }
-            }
-        } else {
-            val tabs = listOf(
-                "ALL", "TRACKS", "ARTISTS", "ALBUMS", "PLAYLISTS"
-            ).map { s ->
-                Tab(s, s.lowercase().replaceFirstChar { it.uppercase() })
-            }
-            Feed(tabs) {
-                when (it?.id) {
-                    "ALL" -> {
-                        val res = api.search(query).value
-                        listOfNotNull(
-                            res.tracks.items.toTrackShelf("TRACKS", imageSize),
-                            res.albums.items.toAlbumShelf("ALBUMS", imageSize),
-                            res.artists.items.toArtistShelf("ARTISTS", imageSize),
-                            res.playlists.items.toPlaylistShelf("PLAYLISTS", imageSize)
-                        ).toFeedData()
-                    }
-                    else -> searchFeedData(query, it!!.id)
-                }
+                else -> searchFeedData(query, tab?.id ?: "ALL")
             }
         }
     }
 
     private fun searchFeedData(query: String, type: String) = PagedData.Continuous<Shelf> {
-        val res = when (type) {
-            "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf(type, imageSize)
-            "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf(type, imageSize)
-            "ARTISTS" -> api.searchArtists(query).value.artists.items.toArtistShelf(type, imageSize)
-            "PLAYLISTS" -> api.searchPlaylists(query).value.playlists.items.toPlaylistShelf(type, imageSize)
-            else -> null
+        val res = withRetry {
+            when (type) {
+                "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf(type, imageSize)
+                "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf(type, imageSize)
+                "ARTISTS" -> api.searchArtists(query).value.artists.items.toArtistShelf(type, imageSize)
+                "PLAYLISTS" -> api.searchPlaylists(query).value.playlists.items.toPlaylistShelf(type, imageSize)
+                else -> null
+            }
         }
         val items = listOfNotNull(res)
         Page(items, null)
@@ -136,9 +204,6 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
     override suspend fun loadTrack(
         track: Track, isDownload: Boolean,
     ): Track {
-        api.userAuthToken = userAuthToken
-        
-        // Define available qualities (5 = MP3, 6 = CD FLAC, 27 = Hi-Res FLAC)
         val qualities = if (only320) {
             listOf(5 to "320kbps MP3")
         } else {
@@ -165,12 +230,10 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         Streamable.MediaType.Server -> {
             val trackId = streamable.extras["id"] ?: error("Track Id not found")
             val formatId = streamable.extras["formatId"]?.toInt() ?: 6
-            api.userAuthToken = userAuthToken
 
-            val streamUrl = if (resolverUrl != null) {
-                // Route stream requests through custom resolver proxy
-                // E.g. GET <resolverUrl>/<trackId>?quality=<formatId>
-                val url = "${resolverUrl.trimEnd('/')}/$trackId?quality=$formatId"
+            val resolver = resolverUrl
+            val streamUrl = if (resolver != null) {
+                val url = "${resolver.trimEnd('/')}/$trackId?quality=$formatId"
                 val req = Request.Builder().url(url).build()
                 httpClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) throw IllegalStateException("Resolver failed: ${resp.code}")
@@ -178,9 +241,10 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
                     parseStreamResult(body) ?: throw IllegalStateException("Could not parse stream URL")
                 }
             } else {
-                // Direct Qobuz API call
-                val fileUrl = api.getFileUrl(trackId.toLong(), formatId).value
-                fileUrl.url ?: throw IllegalStateException("Direct API returned empty URL")
+                withRetry {
+                    val fileUrl = api.getFileUrl(trackId.toLong(), formatId).value
+                    fileUrl.url ?: throw IllegalStateException("Direct API returned empty URL")
+                }
             }
 
             streamUrl.toServerMedia()
@@ -207,55 +271,48 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
 
-    override suspend fun loadAlbum(album: Album): Album {
-        api.userAuthToken = userAuthToken
+    override suspend fun loadAlbum(album: Album): Album = withRetry {
         val response = api.album(album.id).value
-        return response.toAlbum(ImageSize.XLARGE)
+        response.toAlbum(ImageSize.XLARGE)
     }
 
-    override suspend fun loadTracks(album: Album): Feed<Track>? {
-        api.userAuthToken = userAuthToken
+    override suspend fun loadTracks(album: Album): Feed<Track> = withRetry {
         val response = api.album(album.id).value
         val convertedAlbum = response.toAlbum(imageSize)
-        return response.tracks.items.map {
+        response.tracks.items.map {
             it.toTrack(convertedAlbum, imageSize)
         }.toFeed()
     }
 
     override suspend fun loadFeed(album: Album): Feed<Shelf>? = null
 
-    override suspend fun loadPlaylist(playlist: Playlist): Playlist {
-        api.userAuthToken = userAuthToken
+    override suspend fun loadPlaylist(playlist: Playlist): Playlist = withRetry {
         val response = api.playlist(playlist.id).value
-        return response.toPlaylist(ImageSize.XLARGE)
+        response.toPlaylist(ImageSize.XLARGE)
     }
 
-    override suspend fun loadTracks(playlist: Playlist): Feed<Track>? {
-        api.userAuthToken = userAuthToken
+    override suspend fun loadTracks(playlist: Playlist): Feed<Track> = withRetry {
         val response = api.playlist(playlist.id).value
-        return response.tracks.items.map {
+        response.tracks.items.map {
             it.toTrack(imageSize)
         }.toFeed()
     }
 
     override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = null
 
-    override suspend fun loadArtist(artist: Artist): Artist {
-        api.userAuthToken = userAuthToken
-        val response = api.artist(artist.id.toLong()).value
-        // Load first album info or search for artist metadata
+    override suspend fun loadArtist(artist: Artist): Artist = withRetry {
+        val response = api.artist(artist.id).value
         val name = response.albums.items.firstOrNull()?.artist?.name ?: artist.name
-        return Artist(
+        Artist(
             id = artist.id,
             name = name,
             cover = response.albums.items.firstOrNull()?.image.toImage(ImageSize.XLARGE)
         )
     }
 
-    override suspend fun loadFeed(artist: Artist): Feed<Shelf>? {
-        api.userAuthToken = userAuthToken
-        val response = api.artist(artist.id.toLong()).value
+    override suspend fun loadFeed(artist: Artist): Feed<Shelf> = withRetry {
+        val response = api.artist(artist.id).value
         val shelf = response.albums.items.toAlbumShelf("ALBUMS", imageSize)
-        return listOfNotNull(shelf).toFeed()
+        listOfNotNull(shelf).toFeed()
     }
 }

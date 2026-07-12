@@ -3,6 +3,7 @@ package dev.brahmkshatriya.echo.extension
 import dev.brahmkshatriya.echo.common.helpers.ContinuationCallback.Companion.await
 import dev.brahmkshatriya.echo.extension.model.*
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.security.MessageDigest
@@ -26,7 +27,7 @@ class QobuzApi {
         md5("trackgetFileUrl" + "format_id$formatId" + "intentstream" + "track_id$trackId" + ts + APP_SECRET)
 
     private fun requestBuilder(path: String, params: Map<String, String> = mapOf()): Request.Builder {
-        val urlBuilder = HttpUrl.parse("$BASE_URL/$path")!!.newBuilder()
+        val urlBuilder = "$BASE_URL/$path".toHttpUrl().newBuilder()
             .addQueryParameter("app_id", APP_ID)
         params.forEach { (k, v) ->
             urlBuilder.addQueryParameter(k, v)
