@@ -6,6 +6,7 @@ import dev.brahmkshatriya.echo.common.helpers.Page
 import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.*
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.ImageHolder.Companion.toImageHolder
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeedData
 import dev.brahmkshatriya.echo.common.models.Streamable.Companion.server
 import dev.brahmkshatriya.echo.common.models.Streamable.Media.Companion.toServerMedia
@@ -82,9 +83,105 @@ object TokenPool {
 }
 
 class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
-    TrackClient, AlbumClient, PlaylistClient, ArtistClient {
+    TrackClient, AlbumClient, PlaylistClient, ArtistClient, LoginClient.CustomInput {
 
     private lateinit var setting: Settings
+    private var loginUser: User? = null
+
+    override fun setLoginUser(user: User?) {
+        loginUser = user
+        if (user != null) {
+            user.extras["userAuthToken"]?.let {
+                setting.putString("userAuthToken", it)
+            }
+        }
+    }
+
+    override suspend fun getCurrentUser(): User? {
+        val token = userAuthToken ?: return null
+        return try {
+            api.userAuthToken = token
+            val qUser = api.getUser().value
+            User(
+                id = "qobuz:${qUser.id ?: qUser.username ?: "me"}",
+                name = qUser.displayName ?: qUser.username ?: "Qobuz User",
+                cover = qUser.avatar?.let { it.toImageHolder() },
+                extras = mapOf("userAuthToken" to token)
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    override val forms: List<LoginClient.Form> = listOf(
+        LoginClient.Form(
+            key = "credentials",
+            label = "Login with Email & Password",
+            icon = LoginClient.InputField.Type.Email,
+            inputFields = listOf(
+                LoginClient.InputField(
+                    type = LoginClient.InputField.Type.Email,
+                    key = "email",
+                    label = "Email / Username",
+                    isRequired = true
+                ),
+                LoginClient.InputField(
+                    type = LoginClient.InputField.Type.Password,
+                    key = "password",
+                    label = "Password",
+                    isRequired = true
+                )
+            )
+        ),
+        LoginClient.Form(
+            key = "token",
+            label = "Login with Auth Token",
+            icon = LoginClient.InputField.Type.Misc,
+            inputFields = listOf(
+                LoginClient.InputField(
+                    type = LoginClient.InputField.Type.Misc,
+                    key = "userAuthToken",
+                    label = "User Auth Token",
+                    isRequired = true
+                )
+            )
+        )
+    )
+
+    override suspend fun onLogin(key: String, data: Map<String, String?>): List<User> {
+        return when (key) {
+            "credentials" -> {
+                val email = data["email"] ?: throw IllegalArgumentException("Email is required")
+                val password = data["password"] ?: throw IllegalArgumentException("Password is required")
+                val resp = api.login(email, password).value
+                val token = resp.userAuthToken ?: throw IllegalStateException("No auth token returned")
+                setting.putString("userAuthToken", token)
+                api.userAuthToken = token
+                val qUser = resp.user
+                val user = User(
+                    id = "qobuz:${qUser?.id ?: qUser?.username ?: email}",
+                    name = qUser?.displayName ?: qUser?.username ?: email,
+                    cover = qUser?.avatar?.let { it.toImageHolder() },
+                    extras = mapOf("userAuthToken" to token)
+                )
+                listOf(user)
+            }
+            "token" -> {
+                val token = data["userAuthToken"] ?: throw IllegalArgumentException("Token is required")
+                setting.putString("userAuthToken", token)
+                api.userAuthToken = token
+                val qUser = runCatching { api.getUser().value }.getOrNull()
+                val user = User(
+                    id = "qobuz:${qUser?.id ?: "token_user"}",
+                    name = qUser?.displayName ?: qUser?.username ?: "Qobuz User",
+                    cover = qUser?.avatar?.let { it.toImageHolder() },
+                    extras = mapOf("userAuthToken" to token)
+                )
+                listOf(user)
+            }
+            else -> emptyList()
+        }
+    }
 
     override suspend fun getSettingItems() = listOf(
         SettingTextInput(
@@ -231,19 +328,26 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
             val trackId = streamable.extras["id"] ?: error("Track Id not found")
             val formatId = streamable.extras["formatId"]?.toInt() ?: 6
 
-            val resolver = resolverUrl
-            val streamUrl = if (resolver != null) {
-                val url = "${resolver.trimEnd('/')}/$trackId?quality=$formatId"
-                val req = Request.Builder().url(url).build()
-                httpClient.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) throw IllegalStateException("Resolver failed: ${resp.code}")
-                    val body = resp.body?.string().orEmpty()
-                    parseStreamResult(body) ?: throw IllegalStateException("Could not parse stream URL")
-                }
+            val customResolver = resolverUrl
+            val streamUrl = if (customResolver != null) {
+                fetchFromResolver("${customResolver.trimEnd('/')}/$trackId?quality=$formatId")
             } else {
-                withRetry {
-                    val fileUrl = api.getFileUrl(trackId.toLong(), formatId).value
-                    fileUrl.url ?: throw IllegalStateException("Direct API returned empty URL")
+                runCatching {
+                    withRetry {
+                        val fileUrl = api.getFileUrl(trackId.toLong(), formatId).value
+                        fileUrl.url ?: throw IllegalStateException("Direct API returned empty URL")
+                    }
+                }.getOrElse { e ->
+                    val fallbackResolvers = listOf(
+                        "https://citegptapi.f5.si/webhook/qbdlx/stream/$trackId?quality=$formatId",
+                        "https://qbdlx.launchpd.cloud/api/stream/$trackId?quality=$formatId"
+                    )
+                    var resolved: String? = null
+                    for (rUrl in fallbackResolvers) {
+                        resolved = runCatching { fetchFromResolver(rUrl) }.getOrNull()
+                        if (resolved != null) break
+                    }
+                    resolved ?: throw e
                 }
             }
 
@@ -251,6 +355,18 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         }
 
         else -> throw IllegalStateException("Unsupported media type")
+    }
+
+    private suspend fun fetchFromResolver(url: String): String {
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+        return httpClient.newCall(req).await().use { resp ->
+            if (!resp.isSuccessful) throw IllegalStateException("Resolver failed: ${resp.code}")
+            val body = resp.body?.string().orEmpty()
+            parseStreamResult(body) ?: throw IllegalStateException("Could not parse stream URL")
+        }
     }
 
     private fun parseStreamResult(body: String): String? {

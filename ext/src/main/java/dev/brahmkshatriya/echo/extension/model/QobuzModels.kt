@@ -3,6 +3,22 @@ package dev.brahmkshatriya.echo.extension.model
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
+@Serializable
+data class QobuzLoginUser(
+    val id: Long? = null,
+    @SerialName("public_id") val publicId: String? = null,
+    @SerialName("display_name") val displayName: String? = null,
+    val username: String? = null,
+    val email: String? = null,
+    val avatar: String? = null
+)
+
+@Serializable
+data class QobuzLoginResponse(
+    @SerialName("user_auth_token") val userAuthToken: String? = null,
+    val user: QobuzLoginUser? = null
+)
+
 // ── catalog/search ─────────────────────────────────────────────────────
 @Serializable
 data class QobuzSearchResponse(

@@ -136,4 +136,29 @@ class QobuzApi {
         )).build()
         return Json.decode(call(req))
     }
+
+    suspend fun login(username: String, password: String): Json.Decoded<QobuzLoginResponse> {
+        val params = mapOf(
+            "username" to username,
+            "password" to password
+        )
+        val urlBuilder = "$BASE_URL/user/login".toHttpUrl().newBuilder()
+            .addQueryParameter("app_id", APP_ID)
+        params.forEach { (k, v) -> urlBuilder.addQueryParameter(k, v) }
+
+        val req = Request.Builder()
+            .url(urlBuilder.build())
+            .header("Accept", "application/json")
+            .header("User-Agent", UA)
+            .post(okhttp3.FormBody.Builder().apply {
+                params.forEach { (k, v) -> add(k, v) }
+            }.build())
+            .build()
+        return Json.decode(call(req))
+    }
+
+    suspend fun getUser(): Json.Decoded<QobuzLoginUser> {
+        val req = requestBuilder("user/get").build()
+        return Json.decode(call(req))
+    }
 }
