@@ -18,17 +18,19 @@ class QobuzApi {
 
     val client = OkHttpClient()
     var userAuthToken: String? = null
+    var currentAppId: String = APP_ID
+    var currentAppSecret: String = APP_SECRET
 
     private fun md5(s: String): String =
         MessageDigest.getInstance("MD5").digest(s.toByteArray())
             .joinToString("") { "%02x".format(it) }
 
     fun signGetFileUrl(ts: Long, trackId: Long, formatId: Int): String =
-        md5("trackgetFileUrl" + "format_id$formatId" + "intentstream" + "track_id$trackId" + ts + APP_SECRET)
+        md5("trackgetFileUrl" + "format_id$formatId" + "intentstream" + "track_id$trackId" + ts + currentAppSecret)
 
     private fun requestBuilder(path: String, params: Map<String, String> = mapOf()): Request.Builder {
         val urlBuilder = "$BASE_URL/$path".toHttpUrl().newBuilder()
-            .addQueryParameter("app_id", APP_ID)
+            .addQueryParameter("app_id", currentAppId)
         params.forEach { (k, v) ->
             urlBuilder.addQueryParameter(k, v)
         }
@@ -38,7 +40,7 @@ class QobuzApi {
             .header("User-Agent", UA)
         
         userAuthToken?.let { token ->
-            builder.header("X-App-Id", APP_ID)
+            builder.header("X-App-Id", currentAppId)
             builder.header("X-User-Auth-Token", token)
         }
         return builder

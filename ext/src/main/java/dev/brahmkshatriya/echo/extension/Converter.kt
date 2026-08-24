@@ -15,6 +15,20 @@ fun QobuzImage?.toImage(size: ImageSize): ImageHolder? {
     return url.toImageHolder()
 }
 
+fun qobuzServers(trackId: String): List<Streamable> {
+    val qualities = listOf(
+        Triple(5, 320, "320kbps MP3"),
+        Triple(6, 1411, "CD Lossless FLAC"),
+        Triple(27, 4608, "Hi-Res FLAC")
+    )
+    return qualities.map { (formatId, qualityBitrate, label) ->
+        Streamable.server(
+            formatId.toString(), qualityBitrate, label,
+            mapOf("id" to trackId, "formatId" to formatId.toString())
+        )
+    }
+}
+
 fun QobuzTrack.toTrack(size: ImageSize) = Track(
     id = id.toString(),
     title = title,
@@ -36,7 +50,8 @@ fun QobuzTrack.toTrack(size: ImageSize) = Track(
     duration = duration * 1000L,
     isrc = isrc,
     isPlayable = (if (streamable) Track.Playable.Yes else Track.Playable.No) as Track.Playable,
-    isRadioSupported = false
+    isRadioSupported = false,
+    streamables = qobuzServers(id.toString())
 )
 
 fun QobuzAlbumItem.toAlbum(size: ImageSize) = Album(
@@ -80,7 +95,8 @@ fun QobuzAlbumTrackItem.toTrack(album: Album, size: ImageSize) = Track(
     } ?: album.artists.firstOrNull()),
     duration = duration * 1000L,
     isPlayable = Track.Playable.Yes,
-    isRadioSupported = false
+    isRadioSupported = false,
+    streamables = qobuzServers(id.toString())
 )
 
 fun QobuzArtistItem.toArtist(size: ImageSize) = Artist(

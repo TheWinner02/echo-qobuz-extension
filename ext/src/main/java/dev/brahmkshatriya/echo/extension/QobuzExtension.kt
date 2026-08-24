@@ -23,20 +23,26 @@ import kotlinx.serialization.json.contentOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
+data class TokenInfo(
+    val token: String,
+    val appId: String = "798273057",
+    val appSecret: String = "abb21364945c0583309667d13ca3d93a"
+)
+
 object TokenPool {
     private val defaultTokens = listOf(
-        "jM-6F2QcDpfG7fj1RRPq7bAa7tBVCykt__5HD1K25v2yFq0c9_-SmXEhG-74moNpN5YQTmFFyyMq2F70h1G17A",
-        "1aFowv-ylpS5sYZv2ifXwHVjES9RX752HUozlaDS6YqZ4Fugp3pfNb3_40h2IV0IzBzqpkTPpmUi5SHGNP6qIQ",
-        "e5LOIO2m1Da_MCglsOH2I_gjKlmd3dOUguFe9btPlkeSe5vcwU-zUWVyJF272_n_XvIP7M-yAKIpbre_WTqRfw",
-        "J1nl2UXyZ9Pd2SF5s_YjvyNORbwe1UwNjHchv-UgOcE_WgrVSQvCoFQdTxgjYyBYDqgWfHfOlVT5wGZlvINrHA",
-        "79ilZ_slkk1p0ZEoyR0MbynH4m9W1AnDrSlP1wQjyVfzfsa14g5N__AJ2kngJT-j9pNqa6u_qDLiP4_SBapbyA"
+        TokenInfo("7W1P_bimeouwcLTVKjV1UGr_MJp4psetcljd1awOU9QksKi9AmHKvf6MtIdvzP0HuLLENvmM2pJErjSuE_3N3g", "312369995", "e79f8b9be485692b0e5f9dd895826368"),
+        TokenInfo("O97vZDyvXmYhLPfbn07D8Y4SFN02DyRrYb3Pe3rQXWnw1HosDl9vfQTGRQEo2zkkcwP9ADc3L20nYNaI0l7E4g", "312369995", "e79f8b9be485692b0e5f9dd895826368"),
+        TokenInfo("LXcX98uaBz8NPoRZsigyB6TfCemNotzeG7oVwy5XZHPKXNeLMXJUPyEGAM6c5qUpBWnkqmRaRUbJGup9oSsh_w", "312369995", "e79f8b9be485692b0e5f9dd895826368")
     )
     
     private var activeTokens = defaultTokens.toMutableList()
     private var currentIndex = 0
     private var isFetched = false
 
-    fun getActiveToken(): String {
+    val tokenCount: Int get() = activeTokens.size
+
+    fun getActiveToken(): TokenInfo {
         if (activeTokens.isEmpty()) return defaultTokens[0]
         return activeTokens[currentIndex % activeTokens.size]
     }
@@ -61,17 +67,18 @@ object TokenPool {
                 val body = response.body?.string().orEmpty()
                 val json = Json { ignoreUnknownKeys = true }
                 val array = json.parseToJsonElement(body).jsonArray
-                val tokens = mutableListOf<String>()
-                for (element in array) {
+                val tokens = mutableListOf<TokenInfo>()
+                for (element in array.reversed()) {
                     val obj = element.jsonObject
                     val token = obj["token"]?.jsonPrimitive?.contentOrNull
-                    val appId = obj["app_id"]?.jsonPrimitive?.contentOrNull ?: obj["app_id"]?.toString()
-                    if (!token.isNullOrBlank() && appId == "798273057") {
-                        tokens.add(token)
+                    val appId = obj["app_id"]?.jsonPrimitive?.contentOrNull ?: "798273057"
+                    val appSecret = obj["app_secret"]?.jsonPrimitive?.contentOrNull ?: if (appId == "312369995") "e79f8b9be485692b0e5f9dd895826368" else "abb21364945c0583309667d13ca3d93a"
+                    if (!token.isNullOrBlank()) {
+                        tokens.add(TokenInfo(token, appId, appSecret))
                     }
                 }
                 if (tokens.isNotEmpty()) {
-                    activeTokens = tokens.distinct().toMutableList()
+                    activeTokens = tokens.distinctBy { it.token }.toMutableList()
                     currentIndex = 0
                     isFetched = true
                 }
@@ -226,22 +233,22 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         TokenPool.fetchPool(httpClient)
         
         var attempts = 0
-        val maxAttempts = TokenPool.getActiveToken().let { 5 }
+        val maxAttempts = TokenPool.tokenCount.coerceAtLeast(5)
+        var lastException: Exception? = null
         while (attempts < maxAttempts) {
-            val token = TokenPool.getActiveToken()
-            api.userAuthToken = token
+            val tokenInfo = TokenPool.getActiveToken()
+            api.userAuthToken = tokenInfo.token
+            api.currentAppId = tokenInfo.appId
+            api.currentAppSecret = tokenInfo.appSecret
             try {
                 return block()
             } catch (e: Exception) {
-                if (e.message?.contains("401") == true) {
-                    TokenPool.rotateToken()
-                    attempts++
-                } else {
-                    throw e
-                }
+                lastException = e
+                TokenPool.rotateToken()
+                attempts++
             }
         }
-        throw IllegalStateException("Qobuz Pool: All shared tokens failed authentication")
+        throw (lastException ?: IllegalStateException("Qobuz Pool: All shared tokens failed"))
     }
 
     override suspend fun loadHomeFeed(): Feed<Shelf> {
@@ -302,18 +309,18 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         track: Track, isDownload: Boolean,
     ): Track {
         val qualities = if (only320) {
-            listOf(5 to "320kbps MP3")
+            listOf(Triple(5, 320, "320kbps MP3"))
         } else {
             listOf(
-                5 to "320kbps MP3",
-                6 to "CD Lossless FLAC",
-                27 to "Hi-Res FLAC"
+                Triple(5, 320, "320kbps MP3"),
+                Triple(6, 1411, "CD Lossless FLAC"),
+                Triple(27, 4608, "Hi-Res FLAC")
             )
         }
 
-        val servers = qualities.map { (formatId, label) ->
+        val servers = qualities.map { (formatId, qualityBitrate, label) ->
             server(
-                formatId.toString(), formatId, label,
+                formatId.toString(), qualityBitrate, label,
                 mapOf("id" to track.id, "formatId" to formatId.toString())
             )
         }
@@ -335,6 +342,9 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
                 runCatching {
                     withRetry {
                         val fileUrl = api.getFileUrl(trackId.toLong(), formatId).value
+                        if (fileUrl.sample) {
+                            throw IllegalStateException("Direct API returned 30s sample")
+                        }
                         fileUrl.url ?: throw IllegalStateException("Direct API returned empty URL")
                     }
                 }.getOrElse { e ->
