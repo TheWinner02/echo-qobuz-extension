@@ -7,7 +7,8 @@ object Json {
     inline fun <reified T> decode(input: String) = runCatching {
         Decoded(impl.decodeFromString<T>(input), input)
     }.getOrElse {
-        throw IllegalStateException("${it.message}\nINPUT: $input", it)
+        // Responses may contain auth tokens or signed playback URLs.
+        throw IllegalStateException("Invalid Qobuz response (${it.javaClass.simpleName})")
     }
 
     data class Decoded<T>(val value: T, val json: String)

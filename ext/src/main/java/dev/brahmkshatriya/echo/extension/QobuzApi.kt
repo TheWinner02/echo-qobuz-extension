@@ -8,7 +8,12 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.security.MessageDigest
 
-class QobuzApi {
+class QobuzApi(
+    val userAuthToken: String? = null,
+    val currentAppId: String = APP_ID,
+    val currentAppSecret: String = APP_SECRET,
+    val client: OkHttpClient = OkHttpClient(),
+) {
     companion object {
         const val BASE_URL = "https://www.qobuz.com/api.json/0.2"
         const val APP_ID = "798273057"
@@ -16,10 +21,6 @@ class QobuzApi {
         const val UA = "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36"
     }
 
-    val client = OkHttpClient()
-    var userAuthToken: String? = null
-    var currentAppId: String = APP_ID
-    var currentAppSecret: String = APP_SECRET
 
     private fun md5(s: String): String =
         MessageDigest.getInstance("MD5").digest(s.toByteArray())
@@ -47,10 +48,10 @@ class QobuzApi {
     }
 
     suspend fun call(request: Request): String {
-        val response = client.newCall(request).await()
-        val body = response.body?.string().orEmpty()
-        return if (response.isSuccessful) body
-        else throw IllegalStateException("Qobuz Call Failed: ${response.code} $body")
+        return client.newCall(request).await().use { response ->
+            if (!response.isSuccessful) throw IllegalStateException("Qobuz HTTP ${response.code}")
+            response.body?.string().orEmpty()
+        }
     }
 
     suspend fun search(query: String, limit: Int = 50, offset: Int = 0): Json.Decoded<QobuzSearchResponse> {

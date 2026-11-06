@@ -21,7 +21,11 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import okhttp3.OkHttpClient
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class TokenInfo(
     val token: String,
@@ -36,25 +40,30 @@ object TokenPool {
         TokenInfo("LXcX98uaBz8NPoRZsigyB6TfCemNotzeG7oVwy5XZHPKXNeLMXJUPyEGAM6c5qUpBWnkqmRaRUbJGup9oSsh_w", "312369995", "e79f8b9be485692b0e5f9dd895826368")
     )
     
-    private var activeTokens = defaultTokens.toMutableList()
-    private var currentIndex = 0
-    private var isFetched = false
+    private val refreshMutex = Mutex()
+    private val stateLock = Any()
+    private var activeTokens = defaultTokens.toList()
+    private var preferredToken: String? = null
+    private var lastAttempt: Long? = null
+    private var lastSuccess: Long? = null
+    @Volatile var refreshFailure: String? = null
+        private set
+    private const val REFRESH_NS = 5L * 60 * 1_000_000_000
+    private const val RETRY_NS = 30L * 1_000_000_000
 
-    val tokenCount: Int get() = activeTokens.size
-
-    fun getActiveToken(): TokenInfo {
-        if (activeTokens.isEmpty()) return defaultTokens[0]
-        return activeTokens[currentIndex % activeTokens.size]
+    // Each operation gets a stable, distinct snapshot, independent of other requests.
+    fun snapshot(): List<TokenInfo> = synchronized(stateLock) {
+        val start = activeTokens.indexOfFirst { it.token == preferredToken }.coerceAtLeast(0)
+        activeTokens.drop(start) + activeTokens.take(start)
     }
 
-    fun rotateToken() {
-        if (activeTokens.isNotEmpty()) {
-            currentIndex = (currentIndex + 1) % activeTokens.size
-        }
-    }
+    fun prefer(token: TokenInfo) = synchronized(stateLock) { preferredToken = token.token }
 
-    suspend fun fetchPool(client: OkHttpClient) {
-        if (isFetched) return
+    suspend fun fetchPool(client: OkHttpClient, force: Boolean = false) = refreshMutex.withLock {
+        val now = System.nanoTime()
+        if (lastAttempt?.let { now - it < RETRY_NS } == true) return@withLock
+        if (!force && lastSuccess?.let { now - it < REFRESH_NS } == true) return@withLock
+        lastAttempt = now
         try {
             val req = Request.Builder()
                 .url("https://citegptapi.f5.si/webhook/qbdlx/shared")
@@ -62,34 +71,41 @@ object TokenPool {
                 .header("Origin", "https://qbdlx.launchpd.cloud")
                 .header("Referer", "https://qbdlx.launchpd.cloud/")
                 .build()
-            val response = client.newCall(req).await()
-            if (response.isSuccessful) {
-                val body = response.body?.string().orEmpty()
+            val tokens = client.newCall(req).await().use { response ->
+                if (!response.isSuccessful) {
+                    refreshFailure = "HTTP ${response.code}"
+                    return@withLock
+                }
                 val json = Json { ignoreUnknownKeys = true }
-                val array = json.parseToJsonElement(body).jsonArray
-                val tokens = mutableListOf<TokenInfo>()
-                for (element in array.reversed()) {
+                json.parseToJsonElement(response.body?.string().orEmpty()).jsonArray.reversed().mapNotNull { element ->
                     val obj = element.jsonObject
-                    val token = obj["token"]?.jsonPrimitive?.contentOrNull
-                    val appId = obj["app_id"]?.jsonPrimitive?.contentOrNull ?: "798273057"
-                    val appSecret = obj["app_secret"]?.jsonPrimitive?.contentOrNull ?: if (appId == "312369995") "e79f8b9be485692b0e5f9dd895826368" else "abb21364945c0583309667d13ca3d93a"
-                    if (!token.isNullOrBlank()) {
-                        tokens.add(TokenInfo(token, appId, appSecret))
-                    }
-                }
-                if (tokens.isNotEmpty()) {
-                    activeTokens = tokens.distinctBy { it.token }.toMutableList()
-                    currentIndex = 0
-                    isFetched = true
-                }
+                    val token = obj["token"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    val appId = obj["app_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: QobuzApi.APP_ID
+                    val secret = obj["app_secret"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                        ?: if (appId == "312369995") "e79f8b9be485692b0e5f9dd895826368" else QobuzApi.APP_SECRET
+                    TokenInfo(token, appId, secret)
+                }.distinctBy { it.token }
             }
-        } catch (e: Exception) {
-            // Fallback to default hardcoded pool
+            if (tokens.isNotEmpty()) {
+                synchronized(stateLock) { activeTokens = tokens }
+                lastSuccess = System.nanoTime()
+                refreshFailure = null
+            } else {
+                refreshFailure = "Empty account list"
+            }
+        } catch (cancelled: CancellationException) {
+            lastAttempt = null
+            throw cancelled
+        } catch (error: Exception) {
+            refreshFailure = error.javaClass.simpleName
+            // Keep the last usable pool; failed refreshes have a bounded retry cooldown.
         }
     }
+
 }
 
-class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
+class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionClient, HomeFeedClient, SearchFeedClient,
     TrackClient, AlbumClient, PlaylistClient, ArtistClient, LoginClient.CustomInput {
 
     private lateinit var setting: Settings
@@ -107,14 +123,15 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
     override suspend fun getCurrentUser(): User? {
         val token = userAuthToken ?: return null
         return try {
-            api.userAuthToken = token
-            val qUser = api.getUser().value
+            val qUser = authenticatedApi(token).getUser().value
             User(
                 id = "qobuz:${qUser.id ?: qUser.username ?: "me"}",
                 name = qUser.displayName ?: qUser.username ?: "Qobuz User",
                 cover = qUser.avatar?.let { it.toImageHolder() },
                 extras = mapOf("userAuthToken" to token)
             )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             null
         }
@@ -163,7 +180,6 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
                 val resp = api.login(email, password).value
                 val token = resp.userAuthToken ?: throw IllegalStateException("No auth token returned")
                 setting.putString("userAuthToken", token)
-                api.userAuthToken = token
                 val qUser = resp.user
                 val user = User(
                     id = "qobuz:${qUser?.id ?: qUser?.username ?: email}",
@@ -176,8 +192,7 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
             "token" -> {
                 val token = data["userAuthToken"] ?: throw IllegalArgumentException("Token is required")
                 setting.putString("userAuthToken", token)
-                api.userAuthToken = token
-                val qUser = runCatching { api.getUser().value }.getOrNull()
+                val qUser = cancellableAttempt { authenticatedApi(token).getUser().value }.getOrNull()
                 val user = User(
                     id = "qobuz:${qUser?.id ?: "token_user"}",
                     name = qUser?.displayName ?: qUser?.username ?: "Qobuz User",
@@ -220,35 +235,42 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
     val only320 get() = setting.getBoolean("only320") ?: false
 
     val imageSize by lazy { ImageSize.MEDIUM }
-    val api by lazy { QobuzApi() }
-    val httpClient = OkHttpClient()
+    val api by lazy { QobuzApi(client = httpClient) }
 
-    private suspend fun <T> withRetry(block: suspend () -> T): T {
-        val customToken = userAuthToken
-        if (customToken != null) {
-            api.userAuthToken = customToken
-            return block()
-        }
-        
+    private fun authenticatedApi(token: String) = QobuzApi(userAuthToken = token, client = httpClient)
+
+    private suspend fun <T> cancellableAttempt(block: suspend () -> T): Result<T> = try {
+        Result.success(block())
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        Result.failure(error)
+    }
+
+    private suspend fun <T> withRetry(block: suspend (QobuzApi) -> T): T {
+        userAuthToken?.let { return block(authenticatedApi(it)) }
         TokenPool.fetchPool(httpClient)
-        
-        var attempts = 0
-        val maxAttempts = TokenPool.tokenCount.coerceAtLeast(5)
+        val attempted = mutableSetOf<String>()
         var lastException: Exception? = null
-        while (attempts < maxAttempts) {
-            val tokenInfo = TokenPool.getActiveToken()
-            api.userAuthToken = tokenInfo.token
-            api.currentAppId = tokenInfo.appId
-            api.currentAppSecret = tokenInfo.appSecret
-            try {
-                return block()
-            } catch (e: Exception) {
-                lastException = e
-                TokenPool.rotateToken()
-                attempts++
+        // Refresh once after exhaustion; do not repeatedly try identical credentials.
+        repeat(2) { pass ->
+            for (credentials in TokenPool.snapshot()) {
+                if (!attempted.add(credentials.token)) continue
+                val requestApi = QobuzApi(credentials.token, credentials.appId, credentials.appSecret, httpClient)
+                try {
+                    val result = block(requestApi)
+                    TokenPool.prefer(credentials)
+                    return result
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    lastException = error
+                }
             }
+            if (pass == 0) TokenPool.fetchPool(httpClient, force = true)
         }
-        throw (lastException ?: IllegalStateException("Qobuz Pool: All shared tokens failed"))
+        val refresh = TokenPool.refreshFailure?.let { "; pool refresh failed: $it" }.orEmpty()
+        throw IllegalStateException("Qobuz direct API: all ${attempted.size} pool accounts failed$refresh", lastException)
     }
 
     override suspend fun loadHomeFeed(): Feed<Shelf> {
@@ -278,7 +300,7 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         return Feed(tabs) { tab ->
             when (tab?.id) {
                 "ALL" -> {
-                    val res = withRetry { api.search(query).value }
+                    val res = withRetry { api -> api.search(query).value }
                     listOfNotNull(
                         res.tracks.items.toTrackShelf("TRACKS", imageSize),
                         res.albums.items.toAlbumShelf("ALBUMS", imageSize),
@@ -292,7 +314,7 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
     }
 
     private fun searchFeedData(query: String, type: String) = PagedData.Continuous<Shelf> {
-        val res = withRetry {
+        val res = withRetry { api ->
             when (type) {
                 "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf(type, imageSize)
                 "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf(type, imageSize)
@@ -339,8 +361,8 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
             val streamUrl = if (customResolver != null) {
                 fetchFromResolver("${customResolver.trimEnd('/')}/$trackId?quality=$formatId")
             } else {
-                runCatching {
-                    withRetry {
+                cancellableAttempt {
+                    withRetry { api ->
                         val fileUrl = api.getFileUrl(trackId.toLong(), formatId).value
                         if (fileUrl.sample) {
                             throw IllegalStateException("Direct API returned 30s sample")
@@ -352,12 +374,21 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
                         "https://citegptapi.f5.si/webhook/qbdlx/stream/$trackId?quality=$formatId",
                         "https://qbdlx.launchpd.cloud/api/stream/$trackId?quality=$formatId"
                     )
+                    val failures = mutableListOf<Throwable>()
                     var resolved: String? = null
-                    for (rUrl in fallbackResolvers) {
-                        resolved = runCatching { fetchFromResolver(rUrl) }.getOrNull()
+                    for ((index, rUrl) in fallbackResolvers.withIndex()) {
+                        val attempt = cancellableAttempt { fetchFromResolver(rUrl) }
+                        resolved = attempt.getOrNull()
                         if (resolved != null) break
+                        val failure = attempt.exceptionOrNull()!!
+                        // Never include response bodies, credentials or signed URLs in diagnostics.
+                        val reason = (failure as? ResolverFailure)?.message ?: failure.javaClass.simpleName
+                        failures.add(IllegalStateException("Qobuz resolver ${index + 1}: $reason"))
                     }
-                    resolved ?: throw e
+                    resolved ?: throw IllegalStateException(
+                        "Qobuz playback unavailable: direct API and ${failures.size} resolvers failed; " +
+                            failures.joinToString("; ") { it.message.orEmpty() }, e
+                    ).apply { failures.forEach { addSuppressed(it) } }
                 }
             }
 
@@ -367,15 +398,19 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         else -> throw IllegalStateException("Unsupported media type")
     }
 
+    private class ResolverFailure(message: String) : IllegalStateException(message)
+
     private suspend fun fetchFromResolver(url: String): String {
         val req = Request.Builder()
             .url(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .build()
         return httpClient.newCall(req).await().use { resp ->
-            if (!resp.isSuccessful) throw IllegalStateException("Resolver failed: ${resp.code}")
+            if (!resp.isSuccessful) throw ResolverFailure("HTTP ${resp.code}")
             val body = resp.body?.string().orEmpty()
-            parseStreamResult(body) ?: throw IllegalStateException("Could not parse stream URL")
+            val value = parseStreamResult(body)
+            val url = value?.toHttpUrlOrNull()
+            url?.toString() ?: throw ResolverFailure("No valid stream URL in response")
         }
     }
 
@@ -397,12 +432,12 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
 
-    override suspend fun loadAlbum(album: Album): Album = withRetry {
+    override suspend fun loadAlbum(album: Album): Album = withRetry { api ->
         val response = api.album(album.id).value
         response.toAlbum(ImageSize.XLARGE)
     }
 
-    override suspend fun loadTracks(album: Album): Feed<Track> = withRetry {
+    override suspend fun loadTracks(album: Album): Feed<Track> = withRetry { api ->
         val response = api.album(album.id).value
         val convertedAlbum = response.toAlbum(imageSize)
         response.tracks.items.map {
@@ -412,12 +447,12 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
 
     override suspend fun loadFeed(album: Album): Feed<Shelf>? = null
 
-    override suspend fun loadPlaylist(playlist: Playlist): Playlist = withRetry {
+    override suspend fun loadPlaylist(playlist: Playlist): Playlist = withRetry { api ->
         val response = api.playlist(playlist.id).value
         response.toPlaylist(ImageSize.XLARGE)
     }
 
-    override suspend fun loadTracks(playlist: Playlist): Feed<Track> = withRetry {
+    override suspend fun loadTracks(playlist: Playlist): Feed<Track> = withRetry { api ->
         val response = api.playlist(playlist.id).value
         response.tracks.items.map {
             it.toTrack(imageSize)
@@ -426,7 +461,7 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
 
     override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = null
 
-    override suspend fun loadArtist(artist: Artist): Artist = withRetry {
+    override suspend fun loadArtist(artist: Artist): Artist = withRetry { api ->
         val response = api.artist(artist.id).value
         val name = response.albums.items.firstOrNull()?.artist?.name ?: artist.name
         Artist(
@@ -436,7 +471,7 @@ class QobuzExtension : ExtensionClient, HomeFeedClient, SearchFeedClient,
         )
     }
 
-    override suspend fun loadFeed(artist: Artist): Feed<Shelf> = withRetry {
+    override suspend fun loadFeed(artist: Artist): Feed<Shelf> = withRetry { api ->
         val response = api.artist(artist.id).value
         val shelf = response.albums.items.toAlbumShelf("ALBUMS", imageSize)
         listOfNotNull(shelf).toFeed()
