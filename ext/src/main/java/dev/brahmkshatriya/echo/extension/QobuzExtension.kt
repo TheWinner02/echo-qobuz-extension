@@ -1,5 +1,7 @@
 package dev.brahmkshatriya.echo.extension
 
+import dev.brahmkshatriya.echo.common.providers.GlobalSettingsProvider
+
 import dev.brahmkshatriya.echo.common.clients.*
 import dev.brahmkshatriya.echo.common.helpers.ContinuationCallback.Companion.await
 import dev.brahmkshatriya.echo.common.helpers.Page
@@ -106,7 +108,11 @@ object TokenPool {
 }
 
 class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionClient, HomeFeedClient, SearchFeedClient,
-    TrackClient, AlbumClient, PlaylistClient, ArtistClient, LoginClient.CustomInput {
+    TrackClient, AlbumClient, PlaylistClient, ArtistClient, LoginClient.CustomInput, GlobalSettingsProvider {
+    override fun setGlobalSettings(globalSettings: Settings) {
+        ExtensionText.settings = globalSettings
+    }
+
 
     private lateinit var setting: Settings
     private var loginUser: User? = null
@@ -137,35 +143,35 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
         }
     }
 
-    override val forms: List<LoginClient.Form> = listOf(
+    override val forms: List<LoginClient.Form> get() = listOf(
         LoginClient.Form(
             key = "credentials",
-            label = "Login with Email & Password",
+            label = ExtensionText.get("providers.login_with_email_password_117819", "Login with Email & Password"),
             icon = LoginClient.InputField.Type.Email,
             inputFields = listOf(
                 LoginClient.InputField(
                     type = LoginClient.InputField.Type.Email,
                     key = "email",
-                    label = "Email / Username",
+                    label = ExtensionText.get("providers.email_username_2de642", "Email / Username"),
                     isRequired = true
                 ),
                 LoginClient.InputField(
                     type = LoginClient.InputField.Type.Password,
                     key = "password",
-                    label = "Password",
+                    label = ExtensionText.get("providers.password_e7cf3e", "Password"),
                     isRequired = true
                 )
             )
         ),
         LoginClient.Form(
             key = "token",
-            label = "Login with Auth Token",
+            label = ExtensionText.get("providers.login_with_auth_token_5923a6", "Login with Auth Token"),
             icon = LoginClient.InputField.Type.Misc,
             inputFields = listOf(
                 LoginClient.InputField(
                     type = LoginClient.InputField.Type.Misc,
                     key = "userAuthToken",
-                    label = "User Auth Token",
+                    label = ExtensionText.get("providers.user_auth_token_9b3ca7", "User Auth Token"),
                     isRequired = true
                 )
             )
@@ -175,10 +181,10 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
     override suspend fun onLogin(key: String, data: Map<String, String?>): List<User> {
         return when (key) {
             "credentials" -> {
-                val email = data["email"] ?: throw IllegalArgumentException("Email is required")
-                val password = data["password"] ?: throw IllegalArgumentException("Password is required")
+                val email = data["email"] ?: throw IllegalArgumentException(ExtensionText.get("providers.email_is_required_aae929", "Email is required"))
+                val password = data["password"] ?: throw IllegalArgumentException(ExtensionText.get("providers.password_is_required_7aeae1", "Password is required"))
                 val resp = api.login(email, password).value
-                val token = resp.userAuthToken ?: throw IllegalStateException("No auth token returned")
+                val token = resp.userAuthToken ?: throw IllegalStateException(ExtensionText.get("providers.no_auth_token_returned_8b4816", "No auth token returned"))
                 setting.putString("userAuthToken", token)
                 val qUser = resp.user
                 val user = User(
@@ -190,7 +196,7 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
                 listOf(user)
             }
             "token" -> {
-                val token = data["userAuthToken"] ?: throw IllegalArgumentException("Token is required")
+                val token = data["userAuthToken"] ?: throw IllegalArgumentException(ExtensionText.get("providers.token_is_required_6c7181", "Token is required"))
                 setting.putString("userAuthToken", token)
                 val qUser = cancellableAttempt { authenticatedApi(token).getUser().value }.getOrNull()
                 val user = User(
@@ -207,21 +213,21 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
 
     override suspend fun getSettingItems() = listOf(
         SettingTextInput(
-            "Qobuz user_auth_token",
+            ExtensionText.get("providers.qobuz_user_auth_token_b60d2b", "Qobuz user_auth_token"),
             "userAuthToken",
-            "Enter your Qobuz user_auth_token (optional, defaults to shared rotating pool)",
+            ExtensionText.get("providers.enter_your_qobuz_user_auth_token_optional_defaul_316887", "Enter your Qobuz user_auth_token (optional, defaults to shared rotating pool)"),
             ""
         ),
         SettingTextInput(
-            "Qobuz Resolver URL",
+            ExtensionText.get("providers.qobuz_resolver_url_898593", "Qobuz Resolver URL"),
             "resolverUrl",
-            "Base URL for a Qobuz resolver proxy, leave empty for direct API",
+            ExtensionText.get("providers.base_url_for_a_qobuz_resolver_proxy_leave_empty__4bbf44", "Base URL for a Qobuz resolver proxy, leave empty for direct API"),
             ""
         ),
         SettingSwitch(
-            "Always use 320kbps",
+            ExtensionText.get("providers.always_use_320kbps_64f0bb", "Always use 320kbps"),
             "only320",
-            "For streaming, always use 320kbps MP3 instead of FLAC",
+            ExtensionText.get("providers.for_streaming_always_use_320kbps_mp3_instead_of__8f53fe", "For streaming, always use 320kbps MP3 instead of FLAC"),
             false
         )
     )
@@ -276,13 +282,13 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
     override suspend fun loadHomeFeed(): Feed<Shelf> {
         val hasCustom = userAuthToken != null
         val message = if (hasCustom) {
-            "Qobuz active with personal account!"
+            ExtensionText.get("providers.qobuz_active_with_personal_account_8022b2", "Qobuz active with personal account!")
         } else {
-            "Qobuz active with shared rotating token pool!"
+            ExtensionText.get("providers.qobuz_active_with_shared_rotating_token_pool_5e7997", "Qobuz active with shared rotating token pool!")
         }
         val welcomeShelf = Shelf.Lists.Items(
             id = "welcome",
-            title = "Qobuz Lossless Integration",
+            title = ExtensionText.get("providers.qobuz_lossless_integration_f5f868", "Qobuz Lossless Integration"),
             subtitle = message,
             list = emptyList()
         )
@@ -295,17 +301,17 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
         val tabs = listOf(
             "ALL", "TRACKS", "ARTISTS", "ALBUMS", "PLAYLISTS"
         ).map { s ->
-            Tab(s, s.lowercase().replaceFirstChar { it.uppercase() })
+            Tab(s, ExtensionText.category(s))
         }
         return Feed(tabs) { tab ->
             when (tab?.id) {
                 "ALL" -> {
                     val res = withRetry { api -> api.search(query).value }
                     listOfNotNull(
-                        res.tracks.items.toTrackShelf("TRACKS", imageSize),
-                        res.albums.items.toAlbumShelf("ALBUMS", imageSize),
-                        res.artists.items.toArtistShelf("ARTISTS", imageSize),
-                        res.playlists.items.toPlaylistShelf("PLAYLISTS", imageSize)
+                        res.tracks.items.toTrackShelf(ExtensionText.category("TRACKS"), imageSize),
+                        res.albums.items.toAlbumShelf(ExtensionText.category("ALBUMS"), imageSize),
+                        res.artists.items.toArtistShelf(ExtensionText.category("ARTISTS"), imageSize),
+                        res.playlists.items.toPlaylistShelf(ExtensionText.category("PLAYLISTS"), imageSize)
                     ).toFeedData()
                 }
                 else -> searchFeedData(query, tab?.id ?: "ALL")
@@ -316,10 +322,10 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
     private fun searchFeedData(query: String, type: String) = PagedData.Continuous<Shelf> {
         val res = withRetry { api ->
             when (type) {
-                "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf(type, imageSize)
-                "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf(type, imageSize)
-                "ARTISTS" -> api.searchArtists(query).value.artists.items.toArtistShelf(type, imageSize)
-                "PLAYLISTS" -> api.searchPlaylists(query).value.playlists.items.toPlaylistShelf(type, imageSize)
+                "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf(ExtensionText.category(type), imageSize)
+                "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf(ExtensionText.category(type), imageSize)
+                "ARTISTS" -> api.searchArtists(query).value.artists.items.toArtistShelf(ExtensionText.category(type), imageSize)
+                "PLAYLISTS" -> api.searchPlaylists(query).value.playlists.items.toPlaylistShelf(ExtensionText.category(type), imageSize)
                 else -> null
             }
         }
@@ -473,7 +479,7 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
 
     override suspend fun loadFeed(artist: Artist): Feed<Shelf> = withRetry { api ->
         val response = api.artist(artist.id).value
-        val shelf = response.albums.items.toAlbumShelf("ALBUMS", imageSize)
+        val shelf = response.albums.items.toAlbumShelf(ExtensionText.category("ALBUMS"), imageSize)
         listOfNotNull(shelf).toFeed()
     }
 }
