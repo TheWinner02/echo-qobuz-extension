@@ -306,7 +306,11 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
         return Feed(tabs) { tab ->
             when (tab?.id) {
                 "ALL" -> {
-                    val res = withRetry { api -> api.search(query).value }
+                    val res = try {
+                        withRetry { api -> api.search(query).value }
+                    } catch (_: Exception) {
+                        QobuzApi(null, QobuzApi.APP_ID, QobuzApi.APP_SECRET, httpClient).search(query).value
+                    }
                     listOfNotNull(
                         res.tracks.items.toTrackShelf(ExtensionText.category("TRACKS"), imageSize),
                         res.albums.items.toAlbumShelf(ExtensionText.category("ALBUMS"), imageSize),
@@ -320,12 +324,23 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
     }
 
     private fun searchFeedData(query: String, type: String) = PagedData.Continuous<Shelf> {
-        val res = withRetry { api ->
+        val res = try {
+            withRetry { api ->
+                when (type) {
+                    "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf(ExtensionText.category(type), imageSize)
+                    "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf(ExtensionText.category(type), imageSize)
+                    "ARTISTS" -> api.searchArtists(query).value.artists.items.toArtistShelf(ExtensionText.category(type), imageSize)
+                    "PLAYLISTS" -> api.searchPlaylists(query).value.playlists.items.toPlaylistShelf(ExtensionText.category(type), imageSize)
+                    else -> null
+                }
+            }
+        } catch (_: Exception) {
+            val publicApi = QobuzApi(null, QobuzApi.APP_ID, QobuzApi.APP_SECRET, httpClient)
             when (type) {
-                "TRACKS" -> api.searchTracks(query).value.tracks.items.toTrackShelf(ExtensionText.category(type), imageSize)
-                "ALBUMS" -> api.searchAlbums(query).value.albums.items.toAlbumShelf(ExtensionText.category(type), imageSize)
-                "ARTISTS" -> api.searchArtists(query).value.artists.items.toArtistShelf(ExtensionText.category(type), imageSize)
-                "PLAYLISTS" -> api.searchPlaylists(query).value.playlists.items.toPlaylistShelf(ExtensionText.category(type), imageSize)
+                "TRACKS" -> runCatching { publicApi.searchTracks(query).value.tracks.items.toTrackShelf(ExtensionText.category(type), imageSize) }.getOrNull()
+                "ALBUMS" -> runCatching { publicApi.searchAlbums(query).value.albums.items.toAlbumShelf(ExtensionText.category(type), imageSize) }.getOrNull()
+                "ARTISTS" -> runCatching { publicApi.searchArtists(query).value.artists.items.toArtistShelf(ExtensionText.category(type), imageSize) }.getOrNull()
+                "PLAYLISTS" -> runCatching { publicApi.searchPlaylists(query).value.playlists.items.toPlaylistShelf(ExtensionText.category(type), imageSize) }.getOrNull()
                 else -> null
             }
         }
@@ -366,7 +381,7 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
             val customResolver = resolverUrl
             val streamUrl = if (customResolver != null) {
                 fetchFromResolver("${customResolver.trimEnd('/')}/$trackId?quality=$formatId")
-            } else {
+            } else if (userAuthToken != null) {
                 cancellableAttempt {
                     withRetry { api ->
                         val fileUrl = api.getFileUrl(trackId.toLong(), formatId).value
@@ -375,33 +390,37 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
                         }
                         fileUrl.url ?: throw IllegalStateException("Direct API returned empty URL")
                     }
-                }.getOrElse { e ->
-                    val fallbackResolvers = listOf(
-                        "https://citegptapi.f5.si/webhook/qbdlx/stream/$trackId?quality=$formatId",
-                        "https://qbdlx.launchpd.cloud/api/stream/$trackId?quality=$formatId"
-                    )
-                    val failures = mutableListOf<Throwable>()
-                    var resolved: String? = null
-                    for ((index, rUrl) in fallbackResolvers.withIndex()) {
-                        val attempt = cancellableAttempt { fetchFromResolver(rUrl) }
-                        resolved = attempt.getOrNull()
-                        if (resolved != null) break
-                        val failure = attempt.exceptionOrNull()!!
-                        // Never include response bodies, credentials or signed URLs in diagnostics.
-                        val reason = (failure as? ResolverFailure)?.message ?: failure.javaClass.simpleName
-                        failures.add(IllegalStateException("Qobuz resolver ${index + 1}: $reason"))
-                    }
-                    resolved ?: throw IllegalStateException(
-                        "Qobuz playback unavailable: direct API and ${failures.size} resolvers failed; " +
-                            failures.joinToString("; ") { it.message.orEmpty() }, e
-                    ).apply { failures.forEach { addSuppressed(it) } }
+                }.getOrElse {
+                    fetchFromFallbackResolvers(trackId, formatId)
                 }
+            } else {
+                fetchFromFallbackResolvers(trackId, formatId)
             }
 
             streamUrl.toServerMedia()
         }
 
         else -> throw IllegalStateException("Unsupported media type")
+    }
+
+    private suspend fun fetchFromFallbackResolvers(trackId: String, formatId: Int): String {
+        val fallbackResolvers = listOf(
+            "https://citegptapi.f5.si/webhook/qbdlx/stream/$trackId?quality=$formatId",
+            "https://qbdlx.launchpd.cloud/api/stream/$trackId?quality=$formatId"
+        )
+        val failures = mutableListOf<Throwable>()
+        for ((index, rUrl) in fallbackResolvers.withIndex()) {
+            val attempt = cancellableAttempt { fetchFromResolver(rUrl) }
+            val resolved = attempt.getOrNull()
+            if (resolved != null) return resolved
+            val failure = attempt.exceptionOrNull()!!
+            val reason = (failure as? ResolverFailure)?.message ?: failure.javaClass.simpleName
+            failures.add(IllegalStateException("Qobuz resolver ${index + 1}: $reason"))
+        }
+        throw IllegalStateException(
+            "Qobuz playback unavailable: direct API and ${failures.size} resolvers failed; " +
+                failures.joinToString("; ") { it.message.orEmpty() }
+        ).apply { failures.forEach { addSuppressed(it) } }
     }
 
     private class ResolverFailure(message: String) : IllegalStateException(message)
