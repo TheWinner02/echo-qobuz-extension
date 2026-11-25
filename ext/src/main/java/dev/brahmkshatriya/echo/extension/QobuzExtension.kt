@@ -169,7 +169,7 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
             icon = LoginClient.InputField.Type.Misc,
             inputFields = listOf(
                 LoginClient.InputField(
-                    type = LoginClient.InputField.Type.Misc,
+                    type = LoginClient.InputField.Type.Password,
                     key = "userAuthToken",
                     label = ExtensionText.get("providers.user_auth_token_9b3ca7", "User Auth Token"),
                     isRequired = true
@@ -179,36 +179,24 @@ class QobuzExtension(val httpClient: OkHttpClient = OkHttpClient()) : ExtensionC
     )
 
     override suspend fun onLogin(key: String, data: Map<String, String?>): List<User> {
-        return when (key) {
+        val token = when (key) {
             "credentials" -> {
-                val email = data["email"] ?: throw IllegalArgumentException(ExtensionText.get("providers.email_is_required_aae929", "Email is required"))
-                val password = data["password"] ?: throw IllegalArgumentException(ExtensionText.get("providers.password_is_required_7aeae1", "Password is required"))
-                val resp = api.login(email, password).value
-                val token = resp.userAuthToken ?: throw IllegalStateException(ExtensionText.get("providers.no_auth_token_returned_8b4816", "No auth token returned"))
-                setting.putString("userAuthToken", token)
-                val qUser = resp.user
-                val user = User(
-                    id = "qobuz:${qUser?.id ?: qUser?.username ?: email}",
-                    name = qUser?.displayName ?: qUser?.username ?: email,
-                    cover = qUser?.avatar?.let { it.toImageHolder() },
-                    extras = mapOf("userAuthToken" to token)
-                )
-                listOf(user)
+                val email = data["email"]?.trim()?.takeIf { it.isNotEmpty() } ?: error(ExtensionText.get("providers.email_is_required_aae929", "Email is required"))
+                val password = data["password"]?.takeIf { it.isNotBlank() } ?: error(ExtensionText.get("providers.password_is_required_7aeae1", "Password is required"))
+                api.login(email, password).value.userAuthToken?.takeIf { it.isNotBlank() }
+                    ?: error("Qobuz did not return an authentication token")
             }
-            "token" -> {
-                val token = data["userAuthToken"] ?: throw IllegalArgumentException(ExtensionText.get("providers.token_is_required_6c7181", "Token is required"))
-                setting.putString("userAuthToken", token)
-                val qUser = cancellableAttempt { authenticatedApi(token).getUser().value }.getOrNull()
-                val user = User(
-                    id = "qobuz:${qUser?.id ?: "token_user"}",
-                    name = qUser?.displayName ?: qUser?.username ?: "Qobuz User",
-                    cover = qUser?.avatar?.let { it.toImageHolder() },
-                    extras = mapOf("userAuthToken" to token)
-                )
-                listOf(user)
-            }
-            else -> emptyList()
+            "token" -> data["userAuthToken"]?.trim()?.takeIf { it.isNotEmpty() } ?: error(ExtensionText.get("providers.token_is_required_6c7181", "Token is required"))
+            else -> error("Unknown Qobuz login method")
         }
+        // Validate before storing: expired, malformed and rejected tokens must never look connected.
+        val qUser = authenticatedApi(token).getUser().value
+        val id = qUser.id?.takeIf { it > 0 }?.toString() ?: qUser.username?.takeIf { it.isNotBlank() }
+            ?: error("Qobuz did not return a valid account")
+        val user = User("qobuz:$id", qUser.displayName ?: qUser.username ?: "Qobuz User",
+            cover = qUser.avatar?.let { it.toImageHolder() }, extras = mapOf("userAuthToken" to token))
+        setting.putString("userAuthToken", token)
+        return listOf(user)
     }
 
     override suspend fun getSettingItems() = listOf(

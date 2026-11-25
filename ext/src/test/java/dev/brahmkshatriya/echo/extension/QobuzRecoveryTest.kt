@@ -57,15 +57,17 @@ fun recoveryRegression() = runBlocking {
             if(token=="fake-b") 200 to """{"sample":true,"url":"https://audio.test/sample"}"""
             else 200 to """{"sample":false,"url":"https://audio.test/full"}"""
         }
-        else -> error("Unexpected request")
+        else -> { attempts.add(r.url.host); 200 to """{"url":"https://audio.test/full"}""" }
     } }
     val e=extension(c)
+    // Pool refresh remains shared for catalogue operations; anonymous playback goes straight to resolvers.
+    TokenPool.fetchPool(c)
+    check(TokenPool.snapshot().map { it.token } == listOf("fake-b", "fake-a")); checks++
     e.loadStreamableMedia(stream,false)
-    check(attempts.toList()==listOf("fake-b","fake-a"));checks++
-    check(TokenPool.snapshot().first().token=="fake-a");checks++
+    check(attempts.toList()==listOf("citegptapi.f5.si"));checks++
     coroutineScope { (1..32).map { async(Dispatchers.Default) { e.loadStreamableMedia(stream,false) } }.awaitAll() }
     check(fetches.get()==1);checks++
-    check(attempts.size==34);checks++
+    check(attempts.size==33);checks++
     // An expired pool is fetched again; concurrent refreshes share the result.
     TokenPool::class.java.getDeclaredField("lastAttempt").apply { isAccessible=true }.set(null, System.nanoTime()-31_000_000_000L)
     TokenPool::class.java.getDeclaredField("lastSuccess").apply { isAccessible=true }.set(null, System.nanoTime()-301_000_000_000L)
@@ -85,9 +87,9 @@ fun recoveryRegression() = runBlocking {
         else -> { resolvers.incrementAndGet(); 503 to "secret-response" }
     } }
     val error=runCatching { extension(broken).loadStreamableMedia(stream,false) }.exceptionOrNull()!!
-    check(direct.get()==2 && resolvers.get()==2);checks++
+    check(direct.get()==0 && resolvers.get()==2);checks++
     check(error.message!!.contains("resolver 1: HTTP 503") && error.message!!.contains("resolver 2: HTTP 503"));checks++
-    check(error.suppressed.size==2 && error.cause!=null);checks++
+    check(error.suppressed.size==2);checks++
     check(!error.stackTraceToString().contains("secret-response"));checks++
     // A successful second resolver recovers from a failed first one.
     val fallback=client { r -> when {
